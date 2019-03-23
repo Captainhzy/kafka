@@ -24,16 +24,16 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 import kafka.api.Request
 import kafka.common.UnexpectedAppendOffsetException
-import kafka.log.{LogConfig, LogManager, CleanerConfig}
+import kafka.log.{CleanerConfig, LogConfig, LogManager}
 import kafka.server._
-import kafka.utils.{MockTime, TestUtils, MockScheduler}
+import kafka.utils.{MockScheduler, MockTime, TestUtils}
 import kafka.zk.KafkaZkClient
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.errors.ReplicaNotAvailableException
 import org.apache.kafka.common.metrics.Metrics
 import org.apache.kafka.common.utils.Utils
 import org.apache.kafka.common.record._
-import org.apache.kafka.common.requests.LeaderAndIsrRequest
+import org.apache.kafka.common.requests.{EpochEndOffset, LeaderAndIsrRequest}
 import org.junit.{After, Before, Test}
 import org.junit.Assert._
 import org.scalatest.Assertions.assertThrows
@@ -58,10 +58,7 @@ class PartitionTest {
 
   @Before
   def setup(): Unit = {
-    val logProps = new Properties()
-    logProps.put(LogConfig.SegmentBytesProp, 512: java.lang.Integer)
-    logProps.put(LogConfig.SegmentIndexBytesProp, 1000: java.lang.Integer)
-    logProps.put(LogConfig.RetentionMsProp, 999: java.lang.Integer)
+    val logProps = createLogProperties(Map.empty)
     logConfig = LogConfig(logProps)
 
     tmpDir = TestUtils.tempDir()
@@ -86,6 +83,15 @@ class PartitionTest {
     EasyMock.replay(kafkaZkClient)
   }
 
+  private def createLogProperties(overrides: Map[String, String]): Properties = {
+    val logProps = new Properties()
+    logProps.put(LogConfig.SegmentBytesProp, 512: java.lang.Integer)
+    logProps.put(LogConfig.SegmentIndexBytesProp, 1000: java.lang.Integer)
+    logProps.put(LogConfig.RetentionMsProp, 999: java.lang.Integer)
+    overrides.foreach { case (k, v) => logProps.put(k, v) }
+    logProps
+  }
+
   @After
   def tearDown(): Unit = {
     brokerTopicStats.close()
@@ -95,6 +101,78 @@ class PartitionTest {
     Utils.delete(tmpDir)
     logManager.liveLogDirs.foreach(Utils.delete)
     replicaManager.shutdown(checkpointHW = false)
+  }
+
+  @Test
+  def testMakeLeaderUpdatesEpochCache(): Unit = {
+    val controllerEpoch = 3
+    val leader = brokerId
+    val follower = brokerId + 1
+    val controllerId = brokerId + 3
+    val replicas = List[Integer](leader, follower).asJava
+    val isr = List[Integer](leader, follower).asJava
+    val leaderEpoch = 8
+
+    val log = logManager.getOrCreateLog(topicPartition, logConfig)
+    log.appendAsLeader(MemoryRecords.withRecords(0L, CompressionType.NONE, 0,
+      new SimpleRecord("k1".getBytes, "v1".getBytes),
+      new SimpleRecord("k2".getBytes, "v2".getBytes)
+    ), leaderEpoch = 0)
+    log.appendAsLeader(MemoryRecords.withRecords(0L, CompressionType.NONE, 5,
+      new SimpleRecord("k3".getBytes, "v3".getBytes),
+      new SimpleRecord("k4".getBytes, "v4".getBytes)
+    ), leaderEpoch = 5)
+    assertEquals(4, log.logEndOffset)
+
+    val partition = new Partition(topicPartition.topic, topicPartition.partition, time, replicaManager)
+    assertTrue("Expected makeLeader to succeed",
+      partition.makeLeader(controllerId, new LeaderAndIsrRequest.PartitionState(controllerEpoch, leader, leaderEpoch,
+        isr, 1, replicas, true), 0))
+
+    assertEquals(Some(4), partition.leaderReplicaIfLocal.map(_.logEndOffset.messageOffset))
+
+    val epochEndOffset = partition.lastOffsetForLeaderEpoch(leaderEpoch)
+    assertEquals(4, epochEndOffset.endOffset)
+    assertEquals(leaderEpoch, epochEndOffset.leaderEpoch)
+  }
+
+  @Test
+  def testMakeLeaderDoesNotUpdateEpochCacheForOldFormats(): Unit = {
+    val controllerEpoch = 3
+    val leader = brokerId
+    val follower = brokerId + 1
+    val controllerId = brokerId + 3
+    val replicas = List[Integer](leader, follower).asJava
+    val isr = List[Integer](leader, follower).asJava
+
+    val leaderEpoch = 8
+
+    val logConfig = LogConfig(createLogProperties(Map(
+      LogConfig.MessageFormatVersionProp -> kafka.api.KAFKA_0_10_2_IV0.shortVersion)))
+    val log = logManager.getOrCreateLog(topicPartition, logConfig)
+    log.appendAsLeader(TestUtils.records(List(
+      new SimpleRecord("k1".getBytes, "v1".getBytes),
+      new SimpleRecord("k2".getBytes, "v2".getBytes)),
+      magicValue = RecordVersion.V1.value
+    ), leaderEpoch = 0)
+    log.appendAsLeader(TestUtils.records(List(
+      new SimpleRecord("k3".getBytes, "v3".getBytes),
+      new SimpleRecord("k4".getBytes, "v4".getBytes)),
+      magicValue = RecordVersion.V1.value
+    ), leaderEpoch = 5)
+    assertEquals(4, log.logEndOffset)
+
+    val partition = new Partition(topicPartition.topic, topicPartition.partition, time, replicaManager)
+    assertTrue("Expected makeLeader to succeed",
+      partition.makeLeader(controllerId, new LeaderAndIsrRequest.PartitionState(controllerEpoch, leader, leaderEpoch,
+        isr, 1, replicas, true), 0))
+
+    assertEquals(Some(4), partition.leaderReplicaIfLocal.map(_.logEndOffset.messageOffset))
+    assertEquals(EpochEndOffset.UNDEFINED_EPOCH, log.leaderEpochCache.latestEpoch)
+
+    val epochEndOffset = partition.lastOffsetForLeaderEpoch(leaderEpoch)
+    assertEquals(EpochEndOffset.UNDEFINED_EPOCH_OFFSET, epochEndOffset.endOffset)
+    assertEquals(EpochEndOffset.UNDEFINED_EPOCH, epochEndOffset.leaderEpoch)
   }
 
   @Test
@@ -138,6 +216,51 @@ class PartitionTest {
     assertEquals(None, partition.getReplica(Request.FutureLocalReplicaId))
   }
 
+  // Verify that replacement works when the replicas have the same log end offset but different base offsets in the
+  // active segment
+  @Test
+  def testMaybeReplaceCurrentWithFutureReplicaDifferentBaseOffsets(): Unit = {
+    // Write records with duplicate keys to current replica and roll at offset 6
+    logManager.maybeUpdatePreferredLogDir(topicPartition, logDir1.getAbsolutePath)
+    val log1 = logManager.getOrCreateLog(topicPartition, logConfig)
+    log1.appendAsLeader(MemoryRecords.withRecords(0L, CompressionType.NONE, 0,
+      new SimpleRecord("k1".getBytes, "v1".getBytes),
+      new SimpleRecord("k1".getBytes, "v2".getBytes),
+      new SimpleRecord("k1".getBytes, "v3".getBytes),
+      new SimpleRecord("k2".getBytes, "v4".getBytes),
+      new SimpleRecord("k2".getBytes, "v5".getBytes),
+      new SimpleRecord("k2".getBytes, "v6".getBytes)
+    ), leaderEpoch = 0)
+    log1.roll()
+    log1.appendAsLeader(MemoryRecords.withRecords(0L, CompressionType.NONE, 0,
+      new SimpleRecord("k3".getBytes, "v7".getBytes),
+      new SimpleRecord("k4".getBytes, "v8".getBytes)
+    ), leaderEpoch = 0)
+
+    // Write to the future replica as if the log had been compacted, and do not roll the segment
+    logManager.maybeUpdatePreferredLogDir(topicPartition, logDir2.getAbsolutePath)
+    val log2 = logManager.getOrCreateLog(topicPartition, logConfig, isFuture = true)
+    val buffer = ByteBuffer.allocate(1024)
+    var builder = MemoryRecords.builder(buffer, RecordBatch.CURRENT_MAGIC_VALUE, CompressionType.NONE,
+      TimestampType.CREATE_TIME, 0L, RecordBatch.NO_TIMESTAMP, 0)
+    builder.appendWithOffset(2L, new SimpleRecord("k1".getBytes, "v3".getBytes))
+    builder.appendWithOffset(5L, new SimpleRecord("k2".getBytes, "v6".getBytes))
+    builder.appendWithOffset(6L, new SimpleRecord("k3".getBytes, "v7".getBytes))
+    builder.appendWithOffset(7L, new SimpleRecord("k4".getBytes, "v8".getBytes))
+
+    log2.appendAsFollower(builder.build())
+
+    val currentReplica = new Replica(brokerId, topicPartition, time, log = Some(log1))
+    val futureReplica = new Replica(Request.FutureLocalReplicaId, topicPartition, time, log = Some(log2))
+    val partition = new Partition(topicPartition.topic, topicPartition.partition, time, replicaManager)
+
+    partition.addReplicaIfNotExists(futureReplica)
+    partition.addReplicaIfNotExists(currentReplica)
+    assertEquals(Some(currentReplica), partition.getReplica(brokerId))
+    assertEquals(Some(futureReplica), partition.getReplica(Request.FutureLocalReplicaId))
+
+    assertTrue(partition.maybeReplaceCurrentWithFutureReplica())
+  }
 
   @Test
   def testAppendRecordsAsFollowerBelowLogStartOffset(): Unit = {
